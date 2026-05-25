@@ -48,9 +48,8 @@ mkdir -p "${TRAIN_LOG_DIR}"
 PRE_LOGS_LIST="$(mktemp)"
 ls -1 "${TRAIN_LOG_DIR}"/drkernel_8b_rl_*.log 2>/dev/null > "${PRE_LOGS_LIST}" || true
 
-TRAIN_FOREGROUND=1 "${LAUNCHER}" \
+VAL_MAX_TURN="${SMOKE_MAX_TURN}" TRAIN_FOREGROUND=1 "${LAUNCHER}" \
   --max_turn "${SMOKE_MAX_TURN}" \
-  --val_max_turn "${SMOKE_MAX_TURN}" \
   --val_before_train True \
   --train_batch_size 1 \
   --n_val 1 \
