@@ -345,15 +345,12 @@ def _maybe_run_ncu_profile(
     profile pass on the kernel and attach a structured + text summary to
     `kernel_exec_result.metadata`.
 
-    Gating layers (any False stops the run):
-      1. `enable_ncu` kwarg (explicit per-call override from the trainer):
-         - False     -> skip (turns 2+; NCU is too slow to run every turn)
-         - True/None -> fall through to env check
-      2. `KERNELGYM_ENABLE_NCU` env var = 1: required (global on/off).
-      3. Kernel correctness: required (NCU on broken kernels is useless).
+    The three-gate AND is delegated to `should_run_ncu`; see
+    `kernelgym/toolkit/kernelbench/ncu_gate.py` for the truth table.
 
-    First-turn gating is the trainer's responsibility: it sets
-    enable_ncu=True only on turn 0 of multi-turn rollout, False otherwise.
+    Non-final-turn gating is the trainer's responsibility: it sets
+    enable_ncu=True on every turn whose NCU summary has a next-turn
+    prompt to consume it (i.e., turn_idx < max_turns - 1).
     """
     # Gate decision delegated to the should_run_ncu helper so its truth
     # table is unit-testable in isolation.

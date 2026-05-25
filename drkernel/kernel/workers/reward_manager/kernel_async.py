@@ -86,12 +86,13 @@ class AsyncKernelRewardManager:
         except Exception:
             pass
 
-    def execute_env(self, response_str: str, ground_truth: str, entry_point: str, uuid: str, response_ids: list[int], turn_idx=None):
+    def execute_env(self, response_str: str, ground_truth: str, entry_point: str, uuid: str, response_ids: list[int], turn_idx=None, max_turns=None):
         """
         Execute the environment and return the result
         We split it since we hope to re-evaluate when the speedup value is anomaly large.
 
-        turn_idx is forwarded to compute_score so KGym can gate first-turn-only NCU profiling.
+        turn_idx and max_turns are forwarded to compute_score so KGym can gate
+        NCU profiling to non-final turns (turn_idx < max_turns - 1).
         """
         
         try:
@@ -133,10 +134,13 @@ class AsyncKernelRewardManager:
 
                 # 仅传递必要控制参数：reward_config 与 is_valid
                 safe_kwargs = {"reward_config": self.reward_config, "is_valid": self.is_valid}
-                # turn_idx is propagated explicitly so KGym can gate first-turn-only NCU
-                # profiling. None means "no opinion" -> server falls back to env var.
+                # turn_idx + max_turns are propagated explicitly so KGym can gate NCU
+                # profiling to non-final turns. Either being None means "no opinion"
+                # -> server falls back to env var.
                 if turn_idx is not None:
                     safe_kwargs["turn_idx"] = turn_idx
+                if max_turns is not None:
+                    safe_kwargs["max_turns"] = max_turns
 
                 if is_batch:
                     results = self.compute_score(
@@ -246,12 +250,13 @@ class AsyncKernelRewardManager:
         
         print(f"[DEBUG] entry point in reward manager: {entry_point}")
 
-        # First-turn NCU gating: caller (_process_single_turn) puts turn_idx in kwargs.
+        # NCU gating: caller (_process_single_turn) puts turn_idx + max_turns in kwargs.
         turn_idx = kwargs.get("turn_idx", None)
+        max_turns = kwargs.get("max_turns", None)
 
         # 使用计算函数进行评估
 
-        results = self.execute_env(response_str, ground_truth, entry_point, uuid, response_ids, turn_idx=turn_idx)
+        results = self.execute_env(response_str, ground_truth, entry_point, uuid, response_ids, turn_idx=turn_idx, max_turns=max_turns)
 
         speedup = results[0].get("speedup", 0.0)
 
@@ -260,7 +265,7 @@ class AsyncKernelRewardManager:
 
         if speedup > self.reward_config.speedup_reward_upper_bound:
             print(f"[DEBUG] speedup is anomaly large, re-execute the environment")
-            results = self.execute_env(response_str, ground_truth, entry_point, uuid, response_ids, turn_idx=turn_idx)
+            results = self.execute_env(response_str, ground_truth, entry_point, uuid, response_ids, turn_idx=turn_idx, max_turns=max_turns)
             speedup = results[0].get("speedup", 0.0)
 
         results = results[0]

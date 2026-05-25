@@ -1,10 +1,10 @@
 # NCU integration (this fork)
 
-This fork adds **first-turn-only Nsight Compute (NCU) profiling** to the
-sync RL pipeline. NCU runs after the timed perf step, profiles the
-generated kernel(s), and feeds a short SM/DRAM/TensorCore/occupancy
-summary back into the next-turn prompt so the model can reason about
-where time is actually going.
+This fork adds **Nsight Compute (NCU) profiling on every non-final
+rollout turn** to the sync RL pipeline. NCU runs after the timed perf
+step, profiles the generated kernel(s), and feeds a short
+SM/DRAM/TensorCore/occupancy summary back into the next-turn prompt so
+the model can reason about where time is actually going.
 
 Two cooperating processes (KernelGYM evaluator + VERL trainer) are
 joined by one extra field, `enable_ncu`, threaded end-to-end.
@@ -18,24 +18,42 @@ joined by one extra field, `enable_ncu`, threaded end-to-end.
 Launched via `baseline/launch_drkernel_8b_rl_baseline_ncu.sh` →
 `baseline/run_8b_rl_from_8bsft_baseline_ncu.sh` in that workspace.
 
-## Why NCU runs only on turn 0
+## Why NCU runs on every non-final turn
 
 NCU adds ~2–5 s per kernel and locks GPU clocks (which would distort the
-timed perf pass that drives Fast@p). To keep eval latency bounded and
-speedup measurement clean:
+timed perf pass that drives Fast@p). The design choices:
 
 1. NCU runs **after** the timed perf step, never replacing it.
-2. NCU runs only on **turn 0** of multi-turn rollouts. Turn 0 is when the
-   model first produces a kernel; the resulting NCU summary is fed back
-   into the turn-1 prompt. Turns 2+ skip NCU entirely.
+2. NCU runs on **every turn except the last configured turn** of a
+   multi-turn rollout. Each turn's NCU summary is embedded in the
+   next-turn user prompt, so a summary on turn `max_turns - 1` would
+   have nowhere to go. Concretely with `max_turns=3`: NCU runs on
+   turns 0 and 1; turn 2 (the last turn) is skipped.
 3. NCU runs only on **correct** kernels — profiling a broken kernel is
    meaningless.
 
-Three gates enforce this (any False stops the run):
+The trainer-side predicate is
+`decide_enable_ncu(turn_idx, max_turns) -> (turn_idx < max_turns - 1)`,
+extracted into `drkernel/kernel/rewards/ncu_gate.py` so it can be
+unit-tested in isolation.
 
-- Explicit `enable_ncu=False` from the trainer per-call.
+Three gates enforce the final go/no-go (any False stops the run):
+
+- Trainer's per-call `enable_ncu` flag (True = run-if-env-on,
+  False = skip, None = fall back to env).
 - Env var `KERNELGYM_ENABLE_NCU=1` (global on/off).
 - `kernel_exec_result.correctness == True`.
+
+The server-side AND of these gates is
+`should_run_ncu(enable_ncu_flag, env_enabled, is_correct)` in
+`kernelgym/toolkit/kernelbench/ncu_gate.py`.
+
+> **Early termination caveat.** If the model produces a final answer
+> before `max_turns` (no further tool call), that turn is *effectively*
+> the last turn, but we can't know that at gating time. NCU will run
+> and its summary will be discarded. Cost: ~2-5s wasted per
+> early-stop. The alternative (look-ahead detection) isn't reliable, so
+> we accept the waste.
 
 ## KernelGYM side — runs `ncu` and attaches a summary
 
@@ -88,14 +106,16 @@ gpu__time_duration.sum
 | `dram > 60%` and `sm < 30%` | "bandwidth-saturated — fuse adjacent ops or reduce redundant reads" |
 | else | "looks balanced; further gains likely need algorithmic changes" |
 
-## Training side — first-turn-only gating
+## Training side — non-final-turn gating
 
 | File | Change |
 |---|---|
-| `drkernel/kernel/workers/rollout/vllm_rollout/vllm_async_engine.py` | Captures `turn_idx_for_ncu = req.get_num_turns()` and passes via `reward_kwargs` to the reward function. `get_num_turns()` is 0-indexed and reflects turns completed **before** this turn, so the turn that just generated the response has index == `get_num_turns()`. |
-| `drkernel/kernel/workers/reward_manager/kernel_async.py` | `execute_env` now accepts `turn_idx`; `_process_single_turn` forwards it from kwargs. Passes through to `compute_score` so KGym can gate first-turn-only NCU. |
-| `drkernel/kernel/rewards/kernel_reward.py` | Converts: `enable_ncu_flag = (turn_idx == 0)` if known, else `None`. Stamps into the KGym task. Prints `[NCU-GATE] batch_size=... turn_idx=... enable_ncu=...` for greppable trainer logs. |
+| `drkernel/kernel/workers/rollout/vllm_rollout/vllm_async_engine.py` | Captures `turn_idx_for_ncu = req.get_num_turns()` and the surrounding `actual_max_turns`, then puts both in `reward_kwargs`. `get_num_turns()` is 0-indexed and reflects turns completed **before** this turn, so the turn that just generated the response has index == `get_num_turns()`. |
+| `drkernel/kernel/workers/reward_manager/kernel_async.py` | `execute_env` now accepts `turn_idx` and `max_turns`; `_process_single_turn` forwards them from kwargs. Both pass through to `compute_score`. |
+| `drkernel/kernel/rewards/kernel_reward.py` | Calls `decide_enable_ncu(turn_idx, max_turns)` (in `ncu_gate.py`). Stamps the result into the KGym task. Prints `[NCU-GATE] batch_size=... turn_idx=... max_turns=... enable_ncu=...` for greppable trainer logs. |
+| `drkernel/kernel/rewards/ncu_gate.py` | **New.** `decide_enable_ncu(turn_idx, max_turns) -> Optional[bool]`. Pure function, no heavy imports → unit-testable. |
 | `drkernel/kernel/rewards/reward_client.py` | Forwards `enable_ncu` into the HTTP payload only when explicitly `True/False`. `None` is omitted so the server falls back to its env var. |
+| `kernelgym/toolkit/kernelbench/ncu_gate.py` | **New.** `should_run_ncu(enable_ncu_flag, env_enabled, is_correct) -> bool`. AND of the three server-side gates. Used by `pipeline._maybe_run_ncu_profile`. |
 
 ## Launchers (in the workspace, not in this repo)
 
@@ -117,18 +137,21 @@ gpu__time_duration.sum
 ## Data flow
 
 ```
-vllm_async_engine (knows turn index)
-  → kernel_async reward manager (forwards turn_idx)
-    → kernel_reward.compute_score (enable_ncu_flag = turn_idx == 0)
-      → reward_client (HTTP POST with enable_ncu field)
-        → KernelGYM API models.py (accepts field)
-          → schema/task.py (task object carries enable_ncu)
-            → toolkit.py / kernelbench_helpers.py (forwards)
-              → pipeline.eval_kernel_against_ref
-                → _maybe_run_ncu_profile (gates + invokes)
-                  → ncu_profile.profile_and_summarize_source
-                    → metadata.ncu_summary returned in HTTP response
-                      → next-turn prompt rendering picks it up
+vllm_async_engine (knows turn_idx + max_turns)
+  → kernel_async reward manager (forwards both)
+    → kernel_reward.compute_score
+       → decide_enable_ncu(turn_idx, max_turns)  [trainer-side predicate]
+         → enable_ncu_flag = (turn_idx < max_turns - 1)
+           → reward_client (HTTP POST with enable_ncu field)
+             → KernelGYM API models.py (accepts field)
+               → schema/task.py (task object carries enable_ncu)
+                 → toolkit.py / kernelbench_helpers.py (forwards)
+                   → pipeline.eval_kernel_against_ref
+                     → _maybe_run_ncu_profile
+                       → should_run_ncu(flag, env, is_correct)  [server-side predicate]
+                         → ncu_profile.profile_and_summarize_source
+                           → metadata.ncu_summary in HTTP response
+                             → next-turn prompt rendering picks it up
 ```
 
 ## GPU layout for the NCU run

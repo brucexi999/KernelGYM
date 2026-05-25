@@ -129,15 +129,20 @@ def compute_kernel_reward_batch(solution_strs: list, ground_truths: list, entry_
         detect_decoy_kernel = getattr(reward_config, "detect_decoy_kernel")
         reference_backend = getattr(reward_config, "reference_backend")
 
-        # First-turn NCU gating: the rollout caller (vllm_async_engine._step_environment)
-        # passes turn_idx for the kernel just generated. Predicate is delegated to
+        # NCU gating: the rollout caller (vllm_async_engine._step_environment)
+        # passes turn_idx and max_turns for the kernel just generated. NCU runs
+        # on every non-final turn (turn_idx < max_turns-1) so each summary has a
+        # next-turn prompt to consume it. Predicate is delegated to
         # decide_enable_ncu so the gating logic is unit-testable in isolation.
-        # turn_idx=None (no caller info) -> enable_ncu=None -> server falls back to env var.
+        # Missing turn_idx or max_turns -> enable_ncu=None -> server falls back
+        # to env var.
         turn_idx = kwargs.get("turn_idx", None)
-        enable_ncu_flag = decide_enable_ncu(turn_idx)
+        max_turns = kwargs.get("max_turns", None)
+        enable_ncu_flag = decide_enable_ncu(turn_idx, max_turns)
         # CI marker line: makes the gating decision greppable from trainer logs.
         print(
-            f"[NCU-GATE] batch_size={len(solution_strs)} turn_idx={turn_idx} enable_ncu={enable_ncu_flag}",
+            f"[NCU-GATE] batch_size={len(solution_strs)} turn_idx={turn_idx} "
+            f"max_turns={max_turns} enable_ncu={enable_ncu_flag}",
             flush=True,
         )
 
