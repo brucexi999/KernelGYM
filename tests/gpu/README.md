@@ -8,17 +8,23 @@ KernelGYM + Redis setup).
 ## What it does
 
 1. `run_three_turn_smoke.sh` invokes the workspace launcher with
-   overrides that produce a 3-turn rollout (`--max_turn 3`) on a single
-   problem (`--train_batch_size 1`, `--n_val 1`, the 1-row fixture
-   under `fixtures/smoke_1problem.parquet`). Launcher stdout/stderr is
-   captured into `/tmp/ncu_all_turn_smoke_<ts>.log`.
-2. The val_before_train phase runs the full 3-turn rollout over the
-   validation set and emits the `[NCU-GATE]` lines that the verifier
-   needs. The subsequent training step is expected to crash with
-   "AssertionError: only support equal chunk" because
-   `train_batch_size=1` can't divide evenly across the 4 training GPUs
-   — the smoke script tolerates this; the val output is what we test.
-3. It then runs `verify_trajectory.py` against the captured log.
+   overrides that run a single training step on a 4-problem fixture
+   (`--max_turn 3 --train_batch_size 4 --total_epochs 1
+   --val_before_train False`). Launcher stdout/stderr is captured into
+   `/tmp/ncu_all_turn_smoke_<ts>.log`.
+2. The training step drives a full 3-turn rollout per sample with
+   `rollout.n=16` generations per problem, so 4 × 16 = 64 trajectories
+   per step. Each non-final turn of each correct kernel triggers a
+   real NCU profile pass against the running KGym server. The training
+   step's `[NCU-GATE]` lines + `Env Result` blocks land in the
+   captured log.
+3. It then runs `verify_trajectory.py` against the captured log,
+   asserting the all-turn policy (`enable_ncu=True` on turns 0,1;
+   `=False` on turn 2).
+
+`train_batch_size=4` is required because the rollout chunks across
+`n_gpus_per_node=4`; any batch size that doesn't divide evenly will
+trigger `AssertionError: only support equal chunk`.
 
 Expected gating decisions for `max_turns=3`:
 
@@ -51,11 +57,14 @@ export DRKERNEL_WORKSPACE=/path/to/the/parent/workspace
 bash tests/gpu/run_three_turn_smoke.sh
 ```
 
-Expected wallclock: ~20 min on H100s. Most of it is the val_before_train
-phase (vLLM startup + 100 val problems × 3 turns × KGym eval). The
-training step that follows crashes ~5 s in (by design); the smoke
-script swallows that exit code and runs the verifier on the captured
-trajectory.
+Expected wallclock: ~25-35 min on H100s, dominated by vLLM startup
+(~5 min) and the 64-trajectory training rollout with NCU passes on
+non-final turns (~20-25 min depending on how many kernels compile
+successfully). The launcher may still exit non-zero after the step
+completes (logprob recompute / optimizer step / checkpoint save can
+hit unrelated edges with a 4-problem fixture) — the smoke script
+tolerates this and runs the verifier on the captured trajectory
+regardless.
 
 Override knobs (env vars):
 

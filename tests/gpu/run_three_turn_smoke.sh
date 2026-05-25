@@ -1,17 +1,12 @@
 #!/usr/bin/env bash
-# Run a real-GPU smoke that exercises the all-turn NCU gating.
+# Run a real-GPU smoke that exercises the all-turn NCU gating during a
+# real training step.
 #
-# Invokes the workspace launcher with overrides that produce a tiny
-# 3-turn rollout on a single problem (in the val_before_train phase),
-# captures launcher stdout, and runs verify_trajectory.py over it.
-#
-# The training step that follows val will fail with
-# "AssertionError: only support equal chunk. Got size of DataProto 1
-#  and chunk 4."
-# because train_batch_size=1 can't divide evenly across 4 training
-# GPUs. That's expected: the smoke's purpose is to validate gating
-# during val_before_train, not to actually train. The script tolerates
-# the launcher exiting non-zero and verifies the captured trajectory.
+# Invokes the workspace launcher with overrides that:
+#   - skip val_before_train (we have a separate proof of gating in val)
+#   - run exactly one training step over a 4-problem fixture
+#     (train_batch_size=4 must divide evenly across n_gpus_per_node=4)
+# Captures launcher stdout, then runs verify_trajectory.py over it.
 #
 # Required env var:
 #   DRKERNEL_WORKSPACE  — absolute path to the parent workspace where
@@ -32,7 +27,7 @@ SMOKE_DIR="${REPO_DIR}/tests/gpu"
 : "${SMOKE_MAX_TURN:=3}"
 
 LAUNCHER="${DRKERNEL_WORKSPACE}/baseline/launch_drkernel_8b_rl_baseline_ncu.sh"
-SMOKE_DATASET="${SMOKE_DIR}/fixtures/smoke_1problem.parquet"
+SMOKE_DATASET="${SMOKE_DIR}/fixtures/smoke_4problems.parquet"
 
 if [[ ! -x "${LAUNCHER}" ]]; then
   echo "ERROR: launcher not found or not executable: ${LAUNCHER}" >&2
@@ -53,19 +48,18 @@ echo "[smoke] max_turn=${SMOKE_MAX_TURN}"
 echo "[smoke] dataset=${SMOKE_DATASET}"
 echo "[smoke] launcher=${LAUNCHER}"
 echo "[smoke] capture=${CAPTURE_LOG}"
-echo "[smoke] running launcher (val_before_train; training step is expected to crash, that is OK)..."
+echo "[smoke] running launcher (1 training step on 4 problems, no val)..."
 
 LAUNCHER_RC=0
 VAL_MAX_TURN="${SMOKE_MAX_TURN}" TRAIN_FOREGROUND=1 "${LAUNCHER}" \
   --max_turn "${SMOKE_MAX_TURN}" \
-  --val_before_train True \
-  --train_batch_size 1 \
-  --n_val 1 \
+  --val_before_train False \
+  --train_batch_size 4 \
   --total_epochs 1 \
   --train_dataset "${SMOKE_DATASET}" \
   > "${CAPTURE_LOG}" 2>&1 || LAUNCHER_RC=$?
 
-echo "[smoke] launcher exited with rc=${LAUNCHER_RC} (non-zero is expected — see header comment)."
+echo "[smoke] launcher exited with rc=${LAUNCHER_RC} (any non-zero exit after training rollouts complete is tolerable; the verifier reads the captured trajectory)."
 echo "[smoke] running verifier on ${CAPTURE_LOG}..."
 
 exec python3 "${SMOKE_DIR}/verify_trajectory.py" "${CAPTURE_LOG}" --max-turns "${SMOKE_MAX_TURN}"
