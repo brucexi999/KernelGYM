@@ -26,6 +26,11 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+# Ray emits "[NCU-GATE] ..." lines from inside actor processes; their
+# stdout is wrapped in ANSI color codes (e.g., trailing `\x1b[32m
+# [repeated 5x across cluster]\x1b[0m`). Strip ANSI before grouping the
+# captured fields so the bool/int parse doesn't pick up escape bytes.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 GATE_RE = re.compile(
     r"\[NCU-GATE\]\s+"
     r"batch_size=(?P<batch_size>\d+)\s+"
@@ -39,7 +44,8 @@ def parse_gate_lines(log_path: Path) -> list[dict]:
     """Pull every [NCU-GATE] line into a list of dicts."""
     out = []
     with open(log_path, "r", errors="replace") as f:
-        for line in f:
+        for raw in f:
+            line = _ANSI_RE.sub("", raw)
             m = GATE_RE.search(line)
             if m:
                 d = m.groupdict()

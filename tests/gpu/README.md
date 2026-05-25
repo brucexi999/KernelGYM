@@ -10,8 +10,15 @@ KernelGYM + Redis setup).
 1. `run_three_turn_smoke.sh` invokes the workspace launcher with
    overrides that produce a 3-turn rollout (`--max_turn 3`) on a single
    problem (`--train_batch_size 1`, `--n_val 1`, the 1-row fixture
-   under `fixtures/smoke_1problem.parquet`).
-2. It then runs `verify_trajectory.py` against the new trainer log.
+   under `fixtures/smoke_1problem.parquet`). Launcher stdout/stderr is
+   captured into `/tmp/ncu_all_turn_smoke_<ts>.log`.
+2. The val_before_train phase runs the full 3-turn rollout over the
+   validation set and emits the `[NCU-GATE]` lines that the verifier
+   needs. The subsequent training step is expected to crash with
+   "AssertionError: only support equal chunk" because
+   `train_batch_size=1` can't divide evenly across the 4 training GPUs
+   — the smoke script tolerates this; the val output is what we test.
+3. It then runs `verify_trajectory.py` against the captured log.
 
 Expected gating decisions for `max_turns=3`:
 
@@ -44,26 +51,28 @@ export DRKERNEL_WORKSPACE=/path/to/the/parent/workspace
 bash tests/gpu/run_three_turn_smoke.sh
 ```
 
-Expected wallclock: dominated by the first training step (10-30 min
-depending on hardware). The val-before-train phase is what actually
-exercises the all-turn rollout; you can `^C` after the verifier prints
-PASS if you don't care about the training step that follows.
+Expected wallclock: ~20 min on H100s. Most of it is the val_before_train
+phase (vLLM startup + 100 val problems × 3 turns × KGym eval). The
+training step that follows crashes ~5 s in (by design); the smoke
+script swallows that exit code and runs the verifier on the captured
+trajectory.
 
 Override knobs (env vars):
 
 - `SMOKE_MAX_TURN` — default `3`. Use `4` to verify that turns 0,1,2
   enable NCU and turn 3 skips it.
-- `SMOKE_N_TRAIN` — default `1`. Set to `0` if your launcher accepts
-  zero-epoch runs (validation only).
 
 ## Verifier-only mode
 
-If you already have a log from a recent run, skip the launcher and
-just verify:
+If you already have a captured runner log from a recent smoke (under
+`/tmp/ncu_all_turn_smoke_<ts>.log`), skip the launcher and verify:
 
 ```bash
-python3 tests/gpu/verify_trajectory.py /path/to/drkernel_8b_rl_<ts>.log --max-turns 3
+python3 tests/gpu/verify_trajectory.py /tmp/ncu_all_turn_smoke_<ts>.log --max-turns 3
 ```
+
+The verifier strips Ray's ANSI color codes from `[NCU-GATE]` lines
+before parsing, so it works on raw captured stdout from Ray workers.
 
 The verifier also reports a tally of `Env Result` lines with non-empty
 `ncu_summary` — secondary signal that the server-side gate is honoring

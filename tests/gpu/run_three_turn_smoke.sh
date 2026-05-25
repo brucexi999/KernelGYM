@@ -2,31 +2,36 @@
 # Run a real-GPU smoke that exercises the all-turn NCU gating.
 #
 # Invokes the workspace launcher with overrides that produce a tiny
-# 3-turn rollout on a single problem, then runs verify_trajectory.py
-# against the resulting trainer log.
+# 3-turn rollout on a single problem (in the val_before_train phase),
+# captures launcher stdout, and runs verify_trajectory.py over it.
+#
+# The training step that follows val will fail with
+# "AssertionError: only support equal chunk. Got size of DataProto 1
+#  and chunk 4."
+# because train_batch_size=1 can't divide evenly across 4 training
+# GPUs. That's expected: the smoke's purpose is to validate gating
+# during val_before_train, not to actually train. The script tolerates
+# the launcher exiting non-zero and verifies the captured trajectory.
 #
 # Required env var:
 #   DRKERNEL_WORKSPACE  — absolute path to the parent workspace where
 #                         baseline/launch_drkernel_8b_rl_baseline_ncu.sh
-#                         and logs/drkernel_baseline_ncu_rl/ live.
+#                         lives.
 #
 # Optional env vars:
 #   SMOKE_MAX_TURN      — default 3
-#   SMOKE_N_TRAIN       — default 1 (training steps after val_before_train)
 #
-# Exit code: 0 = gating pass, non-zero = verifier or launcher failure.
+# Exit code: 0 = gating pass, non-zero = verifier or fixture failure.
 
-set -euo pipefail
+set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SMOKE_DIR="${REPO_DIR}/tests/gpu"
 
 : "${DRKERNEL_WORKSPACE:?Set DRKERNEL_WORKSPACE to the workspace root (the dir containing baseline/ and logs/).}"
 : "${SMOKE_MAX_TURN:=3}"
-: "${SMOKE_N_TRAIN:=1}"
 
 LAUNCHER="${DRKERNEL_WORKSPACE}/baseline/launch_drkernel_8b_rl_baseline_ncu.sh"
-TRAIN_LOG_DIR="${DRKERNEL_WORKSPACE}/logs/drkernel_baseline_ncu_rl"
 SMOKE_DATASET="${SMOKE_DIR}/fixtures/smoke_1problem.parquet"
 
 if [[ ! -x "${LAUNCHER}" ]]; then
@@ -38,42 +43,29 @@ if [[ ! -f "${SMOKE_DATASET}" ]]; then
   exit 2
 fi
 
-echo "[smoke] max_turn=${SMOKE_MAX_TURN} n_train_steps=${SMOKE_N_TRAIN}"
+# Capture launcher stdout/stderr into a file the verifier can scan.
+# In foreground mode the launcher does not tee to the nominal
+# logs/drkernel_baseline_ncu_rl/drkernel_8b_rl_*.log file, so we own
+# the capture here.
+CAPTURE_LOG="/tmp/ncu_all_turn_smoke_$(date -u +%Y%m%dT%H%M%SZ).log"
+
+echo "[smoke] max_turn=${SMOKE_MAX_TURN}"
 echo "[smoke] dataset=${SMOKE_DATASET}"
 echo "[smoke] launcher=${LAUNCHER}"
-echo "[smoke] running launcher in foreground..."
+echo "[smoke] capture=${CAPTURE_LOG}"
+echo "[smoke] running launcher (val_before_train; training step is expected to crash, that is OK)..."
 
-# Snapshot the existing log timestamps so we can identify the new one.
-mkdir -p "${TRAIN_LOG_DIR}"
-PRE_LOGS_LIST="$(mktemp)"
-ls -1 "${TRAIN_LOG_DIR}"/drkernel_8b_rl_*.log 2>/dev/null > "${PRE_LOGS_LIST}" || true
-
+LAUNCHER_RC=0
 VAL_MAX_TURN="${SMOKE_MAX_TURN}" TRAIN_FOREGROUND=1 "${LAUNCHER}" \
   --max_turn "${SMOKE_MAX_TURN}" \
   --val_before_train True \
   --train_batch_size 1 \
   --n_val 1 \
-  --total_epochs "${SMOKE_N_TRAIN}" \
-  --train_dataset "${SMOKE_DATASET}"
+  --total_epochs 1 \
+  --train_dataset "${SMOKE_DATASET}" \
+  > "${CAPTURE_LOG}" 2>&1 || LAUNCHER_RC=$?
 
-echo "[smoke] launcher finished. Locating new training log..."
+echo "[smoke] launcher exited with rc=${LAUNCHER_RC} (non-zero is expected — see header comment)."
+echo "[smoke] running verifier on ${CAPTURE_LOG}..."
 
-# Find the log file that did not exist before launch.
-NEW_LOG=""
-for f in "${TRAIN_LOG_DIR}"/drkernel_8b_rl_*.log; do
-  if ! grep -qxF "${f}" "${PRE_LOGS_LIST}"; then
-    NEW_LOG="${f}"
-    break
-  fi
-done
-rm -f "${PRE_LOGS_LIST}"
-
-if [[ -z "${NEW_LOG}" ]]; then
-  echo "ERROR: could not identify the smoke's training log under ${TRAIN_LOG_DIR}" >&2
-  exit 3
-fi
-
-echo "[smoke] training log: ${NEW_LOG}"
-echo "[smoke] running verifier..."
-
-exec python3 "${SMOKE_DIR}/verify_trajectory.py" "${NEW_LOG}" --max-turns "${SMOKE_MAX_TURN}"
+exec python3 "${SMOKE_DIR}/verify_trajectory.py" "${CAPTURE_LOG}" --max-turns "${SMOKE_MAX_TURN}"
