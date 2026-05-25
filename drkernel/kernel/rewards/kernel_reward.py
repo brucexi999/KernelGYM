@@ -22,6 +22,7 @@ import logging
 import re
 from typing import Dict, Any
 from kernel.rewards.reward_client import KernelRewardClient
+from kernel.rewards.ncu_gate import decide_enable_ncu
 
 
 # 全局客户端实例与其配置，复用连接且在配置变更时重建
@@ -129,14 +130,11 @@ def compute_kernel_reward_batch(solution_strs: list, ground_truths: list, entry_
         reference_backend = getattr(reward_config, "reference_backend")
 
         # First-turn NCU gating: the rollout caller (vllm_async_engine._step_environment)
-        # passes turn_idx for the kernel just generated. NCU runs only on turn 0 (the
-        # model's first attempt); subsequent turns are skipped to keep eval latency low.
+        # passes turn_idx for the kernel just generated. Predicate is delegated to
+        # decide_enable_ncu so the gating logic is unit-testable in isolation.
         # turn_idx=None (no caller info) -> enable_ncu=None -> server falls back to env var.
         turn_idx = kwargs.get("turn_idx", None)
-        if turn_idx is None:
-            enable_ncu_flag = None
-        else:
-            enable_ncu_flag = (int(turn_idx) == 0)
+        enable_ncu_flag = decide_enable_ncu(turn_idx)
         # CI marker line: makes the gating decision greppable from trainer logs.
         print(
             f"[NCU-GATE] batch_size={len(solution_strs)} turn_idx={turn_idx} enable_ncu={enable_ncu_flag}",

@@ -17,6 +17,7 @@ from kernelgym.toolkit.kernelbench.loading import (
     load_original_model_and_inputs,
 )
 from kernelgym.toolkit.kernelbench.correctness import run_and_check_correctness
+from kernelgym.toolkit.kernelbench.ncu_gate import should_run_ncu
 from kernelgym.toolkit.kernelbench.profiling import compute_triton_kernel_coverage
 from kernelgym.toolkit.kernelbench.timing import (
     get_timing_stats,
@@ -354,12 +355,11 @@ def _maybe_run_ncu_profile(
     First-turn gating is the trainer's responsibility: it sets
     enable_ncu=True only on turn 0 of multi-turn rollout, False otherwise.
     """
-    # Per-call override: False explicitly disables.
-    if enable_ncu is False:
-        return
-    if os.environ.get("KERNELGYM_ENABLE_NCU", "0") != "1":
-        return
-    if not (kernel_exec_result and kernel_exec_result.correctness):
+    # Gate decision delegated to the should_run_ncu helper so its truth
+    # table is unit-testable in isolation.
+    env_enabled = os.environ.get("KERNELGYM_ENABLE_NCU", "0") == "1"
+    is_correct = bool(kernel_exec_result and kernel_exec_result.correctness)
+    if not should_run_ncu(enable_ncu, env_enabled, is_correct):
         return
     if not custom_model_src:
         return
