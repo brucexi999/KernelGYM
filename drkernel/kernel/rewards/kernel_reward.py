@@ -127,7 +127,22 @@ def compute_kernel_reward_batch(solution_strs: list, ground_truths: list, entry_
         verbose_errors = getattr(reward_config, "verbose_errors")
         detect_decoy_kernel = getattr(reward_config, "detect_decoy_kernel")
         reference_backend = getattr(reward_config, "reference_backend")
-        
+
+        # First-turn NCU gating: the rollout caller (vllm_async_engine._step_environment)
+        # passes turn_idx for the kernel just generated. NCU runs only on turn 0 (the
+        # model's first attempt); subsequent turns are skipped to keep eval latency low.
+        # turn_idx=None (no caller info) -> enable_ncu=None -> server falls back to env var.
+        turn_idx = kwargs.get("turn_idx", None)
+        if turn_idx is None:
+            enable_ncu_flag = None
+        else:
+            enable_ncu_flag = (int(turn_idx) == 0)
+        # CI marker line: makes the gating decision greppable from trainer logs.
+        print(
+            f"[NCU-GATE] batch_size={len(solution_strs)} turn_idx={turn_idx} enable_ncu={enable_ncu_flag}",
+            flush=True,
+        )
+
         for i, solution_str in enumerate(solution_strs):
             # reference_code = extract_reference_code(solution_str)
             reference_code = ground_truths[i]
@@ -154,6 +169,7 @@ def compute_kernel_reward_batch(solution_strs: list, ground_truths: list, entry_
                 "verbose_errors": verbose_errors,
                 "detect_decoy_kernel": detect_decoy_kernel,
                 "reference_backend": reference_backend,
+                "enable_ncu": enable_ncu_flag,
             })
         
         # 同步调用异步函数

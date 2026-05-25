@@ -1719,7 +1719,12 @@ class MultiTurnAsyncvLLMEngine:
         #     [data_source],
         #     [extra_info],
         # )
-        reward_kwargs = {"response_length": max_tokens}
+        # First-turn NCU gating: req.get_num_turns() is 0-indexed and reflects
+        # turns completed BEFORE this turn (i.e., the turn that just generated
+        # the response we're about to evaluate has index == get_num_turns()).
+        # Pass through to reward_fn so KGym only runs NCU when turn_idx == 0.
+        turn_idx_for_ncu = req.get_num_turns()
+        reward_kwargs = {"response_length": max_tokens, "turn_idx": turn_idx_for_ncu}
 
         # Use run_in_executor to run sync reward_fn in async context
         reward_fn = self.val_reward_fn if is_validate else self.reward_fn

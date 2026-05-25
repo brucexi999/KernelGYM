@@ -103,6 +103,7 @@ def _create_paired_tasks(
         entry_point=task.entry_point,
         device_preference=task.device_preference,
         enable_profiling=task.enable_profiling,
+        enable_ncu=task.enable_ncu,
         enable_triton_detection=task.enable_triton_detection,
         measure_performance=task.measure_performance,
         run_correctness=task.run_correctness,

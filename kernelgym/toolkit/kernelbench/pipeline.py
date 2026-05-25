@@ -330,6 +330,73 @@ def _run_performance_step(
             print(f"[Eval] Error in Measuring Performance: {e}")
         kernel_exec_result.metadata["error_during_performance"] = e
 
+def _maybe_run_ncu_profile(
+    *,
+    kernel_exec_result: "KernelExecResult",
+    original_model_src: Optional[str],
+    custom_model_src: Optional[str],
+    entry_point: str,
+    device: Union[torch.device, int],
+    verbose: bool,
+    enable_ncu: Optional[bool] = None,
+) -> None:
+    """If NCU is enabled and the kernel passed correctness, run an NCU
+    profile pass on the kernel and attach a structured + text summary to
+    `kernel_exec_result.metadata`.
+
+    Gating layers (any False stops the run):
+      1. `enable_ncu` kwarg (explicit per-call override from the trainer):
+         - False     -> skip (turns 2+; NCU is too slow to run every turn)
+         - True/None -> fall through to env check
+      2. `KERNELGYM_ENABLE_NCU` env var = 1: required (global on/off).
+      3. Kernel correctness: required (NCU on broken kernels is useless).
+
+    First-turn gating is the trainer's responsibility: it sets
+    enable_ncu=True only on turn 0 of multi-turn rollout, False otherwise.
+    """
+    # Per-call override: False explicitly disables.
+    if enable_ncu is False:
+        return
+    if os.environ.get("KERNELGYM_ENABLE_NCU", "0") != "1":
+        return
+    if not (kernel_exec_result and kernel_exec_result.correctness):
+        return
+    if not custom_model_src:
+        return
+    try:
+        from kernelgym.toolkit.kernelbench.ncu_profile import profile_and_summarize_source
+    except Exception as e:
+        if verbose:
+            print(f"[Eval] NCU import failed: {e}")
+        return
+
+    device_idx = device.index if isinstance(device, torch.device) else int(device or 0)
+    if verbose:
+        print(f"[Eval] Running NCU profile (device={device_idx})...")
+    try:
+        result = profile_and_summarize_source(
+            kernel_source=custom_model_src,
+            reference_source=original_model_src,
+            entry_point=f"{entry_point}New",
+            device=device_idx,
+        )
+    except Exception as e:
+        if verbose:
+            print(f"[Eval] NCU profile crashed: {e}")
+        kernel_exec_result.metadata["ncu_error"] = str(e)
+        return
+
+    if isinstance(kernel_exec_result.metadata, dict):
+        kernel_exec_result.metadata["ncu_summary"] = result.get("summary_text") or ""
+        kernel_exec_result.metadata["ncu_overhead_sec"] = result.get("ncu_wallclock_sec", 0.0)
+        kernel_exec_result.metadata["ncu_num_kernels"] = result.get("num_kernels", 0)
+        if verbose:
+            print(
+                f"[Eval] NCU done in {result.get('ncu_wallclock_sec')}s, "
+                f"captured {result.get('num_kernels')} kernels"
+            )
+
+
 def eval_kernel_against_ref(
     original_model_src: str,
     custom_model_src: str,
@@ -347,6 +414,7 @@ def eval_kernel_against_ref(
     enable_profiling: bool = True,
     enable_triton_detection: bool = True,
     backend_adapter: Optional[Any] = None,
+    enable_ncu: Optional[bool] = None,
 ) -> KernelExecResult:
     assert torch.cuda.is_available(), "CUDA is not available, cannot run Eval"
     torch.set_printoptions(
@@ -550,6 +618,21 @@ def eval_kernel_against_ref(
             seed_num=seed_num,
             device=device,
             enable_profiling=enable_profiling,
+        )
+        # Stage-1: optional NCU profile pass for richer next-turn feedback.
+        # Gated by:
+        #   1. enable_ncu kwarg (per-call override): False = always skip; True = run if env enables;
+        #      None = use env var only.
+        #   2. KERNELGYM_ENABLE_NCU=1 env var (global gate inside _maybe_run_ncu_profile).
+        # Use False to disable NCU on turn 2+ rollouts (NCU is slow, ~2-5s per kernel).
+        _maybe_run_ncu_profile(
+            kernel_exec_result=kernel_exec_result,
+            original_model_src=original_model_src,
+            custom_model_src=custom_model_src,
+            entry_point=entry_point,
+            device=device,
+            verbose=verbose,
+            enable_ncu=enable_ncu,
         )
 
     _cleanup()

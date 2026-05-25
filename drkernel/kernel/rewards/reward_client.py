@@ -648,6 +648,11 @@ class KernelRewardClient:
                 "detect_decoy_kernel": task.get("detect_decoy_kernel", True),
                 "reference_backend": task.get("reference_backend", None),
             }
+            # Forward first-turn NCU flag only when explicitly set (True/False).
+            # None means "no opinion" -> server falls back to KERNELGYM_ENABLE_NCU env var.
+            _ncu = task.get("enable_ncu", None)
+            if _ncu is not None:
+                payload["enable_ncu"] = bool(_ncu)
 
             # enforce detect decoy kernel if validate
             if payload["is_valid"]:

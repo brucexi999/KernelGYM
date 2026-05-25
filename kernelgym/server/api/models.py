@@ -42,6 +42,12 @@ class EvaluationRequest(BaseModel):
         default=None,
         description="Enable torch.profiler for this request. None=use server default, True=enable, False=disable",
     )
+    enable_ncu: Optional[bool] = Field(
+        default=None,
+        description="Enable Nsight Compute (NCU) profile for this request. "
+                    "None=fall back to KERNELGYM_ENABLE_NCU env var; True/False overrides per-call. "
+                    "Used to make NCU turn-1-only (NCU is slow, ~2-5s per kernel).",
+    )
     enable_triton_detection: Optional[bool] = Field(
         default=None,
         description="Enable Triton kernel usage detection (decoy check)",

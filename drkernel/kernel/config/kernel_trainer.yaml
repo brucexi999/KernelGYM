@@ -27,6 +27,7 @@ reward_model:
   print_status: true             # 是否打印每个评测样本的状态
   speedup_reward_upper_bound: 3.0      # 加速奖励上限
   speedup_reward_lower_bound: 0.0      # 加速奖励下限
+  reference_backend: null
   reward_policy:
     penalties:
       penalty_score: 0.0

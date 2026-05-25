@@ -70,6 +70,7 @@ VAL_MAX_TURN=${VAL_MAX_TURN:-$MAX_TURN}
 GAMMA=${GAMMA:-1.0}
 
 DETECT_DECOY_KERNEL=${DETECT_DECOY_KERNEL:-True}
+REFERENCE_BACKEND=${REFERENCE_BACKEND:-"pytorch"}
 
 
 IS_GET_LAST_TURN=${IS_GET_LAST_TURN:-False}
@@ -459,6 +460,7 @@ parse_arguments() {
       --is_get_last_turn) IS_GET_LAST_TURN="$2"; shift 2 ;;
       --speedup_reward_upper_bound) SPEEDUP_REWARD_UPPER_BOUND="$2"; shift 2 ;;
       --speedup_reward_lower_bound) SPEEDUP_REWARD_LOWER_BOUND="$2"; shift 2 ;;
+      --reference_backend) REFERENCE_BACKEND="$2"; shift 2 ;;
       --reward_shaping) REWARD_SHAPING="$2"; shift 2 ;;
       --unbiased_shaping) UNBIASED_SHAPING="$2"; shift 2 ;;
       --gamma) GAMMA="$2"; shift 2 ;;
@@ -780,6 +782,7 @@ run_training() {
       reward_model.reward_func_name=$REWARD_FUNC_NAME \
       reward_model.speedup_reward_upper_bound=$SPEEDUP_REWARD_UPPER_BOUND \
       reward_model.speedup_reward_lower_bound=$SPEEDUP_REWARD_LOWER_BOUND \
+      reward_model.reference_backend=$REFERENCE_BACKEND \
       reward_model.coverage_reward.reward_type=$COVERAGE_REWARD_TYPE \
       reward_model.coverage_reward.weight=$COVERAGE_REWARD_WEIGHT \
       reward_model.coverage_reward.enable=$COVERAGE_REWARD_ENABLE \

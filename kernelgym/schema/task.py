@@ -27,6 +27,7 @@ class EvaluationTask:
     use_reference_cache: bool = False
     is_valid: bool = False
     enable_profiling: Optional[bool] = None
+    enable_ncu: Optional[bool] = None
     enable_triton_detection: Optional[bool] = None
     measure_performance: Optional[bool] = None
     run_correctness: Optional[bool] = None
@@ -88,6 +89,7 @@ class KernelEvaluationTask:
     entry_point: str = "Model"
     device_preference: Optional[str] = None
     enable_profiling: Optional[bool] = None
+    enable_ncu: Optional[bool] = None
     enable_triton_detection: Optional[bool] = None
     measure_performance: Optional[bool] = None
     run_correctness: Optional[bool] = None

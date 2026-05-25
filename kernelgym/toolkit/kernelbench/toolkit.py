@@ -130,6 +130,7 @@ class KernelBenchToolkit(Toolkit):
                 enable_profiling=bool(enable_profiling),
                 enable_triton_detection=enable_triton_detection,
                 backend_adapter=backend_adapter,
+                enable_ncu=task.enable_ncu,
             )
 
             if not run_correctness:
@@ -304,6 +305,7 @@ class KernelBenchToolkit(Toolkit):
                 enable_profiling=enable_profiling,
                 enable_triton_detection=enable_triton_detection,
                 backend_adapter=backend_adapter,
+                enable_ncu=task.enable_ncu,
             )
 
             if not run_correctness:
