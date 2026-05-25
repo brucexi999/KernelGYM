@@ -1,2 +1,24 @@
 data/
 .claude/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Training artifacts
+logs/
+wandb/
+checkpoints/
+outputs/
+drkernel/outputs/
+drkernel/wandb/
+drkernel/checkpoints/
+drkernel/tea_debug.log
+*.log
+model_rng_offset.txt
