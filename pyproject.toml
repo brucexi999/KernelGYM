@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --strict-markers"
+markers = [
+    "unit: fast, no GPU, no network",
+    "gpu: requires CUDA + ncu binary; not run in CI",
+]
