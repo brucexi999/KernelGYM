@@ -26,39 +26,39 @@ from typing import Optional
 
 ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 
-# Eval-step boundary: line starting with "step:N - val/test_score/..."
-EVAL_LINE = re.compile(r'\bstep:(\d+)\s*-\s*val/test_score/')
+# Step boundary: the trainer prints multiple `step:N - ...` lines per
+# step (one short header w/ over_sampling/, then the long metrics dump).
+# We want the LONG metrics dump line — for training it starts with
+# `batch/` after the step prefix; for eval it contains `val/test_score`.
+# Match either; the dispatcher below picks eval vs train.
+STEP_LINE = re.compile(
+    r'\bstep:(\d+)\s*-\s+(?:batch/|val/test_score/|val/kernel/)'
+)
 
-# Best-of-3 metrics (printed BEFORE the eval-step boundary line, one key per log line):
-#   'val/kernel/best_by_turn_3/correctness_rate': 0.56,
-#   'val/kernel/best_by_turn_3/fast@1': 0.7589,
-#   ... etc
+# Best-of-3 metrics (printed in a wandb-pretty-print block on separate
+# lines, one key per line). The plot script uses the `_in_all` variants
+# (denominator = all 100 val problems, not just correct ones), so we
+# prefer those.
 BEST3_LINE = re.compile(
     r"val/kernel/best_by_turn_3/([A-Za-z0-9_@.]+)"
     r"['\"]?\s*:\s*([0-9.+\-eE]+)"
 )
 
-# Training-step metric dump: same step:N prefix but with training metrics
-# instead of val/. The trainer prints these every step.
-# Examples that appear in logs:
-#   'critic/score/mean': 0.123
-#   'critic/score/max': 1.234
-#   'response_length/mean': 8192
-#   'training/global_step': 5
+# Training-step scalar metrics — exact keys this verl/drkernel build emits
+# in the `step:N - <kv> - <kv> ...` dump line.
 TRAIN_KV = re.compile(
-    r"['\"](critic/score/mean|critic/score/max|critic/score/min|"
-    r"response_length/mean|prompt_length/mean|"
+    r"['\"]?("
+    r"critic/score/mean|"
+    r"critic/rewards/mean|"
+    r"critic/rewards_extra/correctness/mean|"
     r"timing_s/step|"
-    r"training/global_step|"
-    r"actor/grad_norm|actor/pg_loss|"
-    r"reward_extra/correctness/mean|reward_extra/correctness_tensor/mean|"
-    r"reward_extra/performance/mean|reward_extra/is_speedup_positive/mean)"
-    r"['\"]\s*:\s*([0-9.+\-eE]+)"
+    r"actor/grad_norm|"
+    r"response_length/mean|"
+    r"train/kernel/best_by_turn_3/correctness_rate|"
+    r"train/kernel/best_by_turn_3/mean_performance_in_all|"
+    r"train/kernel/best_by_turn_3/fast@1_in_all"
+    r")['\"]?\s*:\s*([0-9.+\-eE]+)"
 )
-
-# Training-step boundary: a line like "step:N - training/...:Y - ..."
-# (mirror of the eval boundary). Some verl versions emit a `Training step N done` line.
-TRAIN_BOUNDARY = re.compile(r'\bstep:(\d+)\s*-\s*training/')
 
 # OOM / crash markers
 OOM_PATTERNS = (
@@ -104,10 +104,16 @@ def wait_for_log(log_dir: str, max_wait_sec: int = 600) -> Optional[str]:
 # ----- main parse loop ------------------------------------------------------
 
 
-def tail(path: str):
-    """Generator yielding new lines as the file grows (poll-based)."""
+def tail(path: str, from_start: bool = False):
+    """Generator yielding new lines as the file grows (poll-based).
+
+    With from_start=True, reads the whole existing file first (useful for
+    backfilling step events that fired before the monitor started), then
+    continues tailing for new appends.
+    """
     with open(path, 'r', errors='replace') as f:
-        f.seek(0, os.SEEK_END)
+        if not from_start:
+            f.seek(0, os.SEEK_END)
         while True:
             line = f.readline()
             if line:
@@ -125,6 +131,8 @@ def main() -> int:
                     help='where to auto-discover the latest *.log')
     ap.add_argument('--hang-sec', type=int, default=900,
                     help='alert if no new line for this many seconds (default 15 min)')
+    ap.add_argument('--from-start', action='store_true',
+                    help='read the whole existing log first (backfill step events) before tailing')
     args = ap.parse_args()
 
     log_path = args.log
@@ -137,104 +145,115 @@ def main() -> int:
 
     print(f'[{now_str()}] [monitor] tailing {log_path}', flush=True)
 
-    # Per-eval-step accumulators (best_by_turn_3 keys appear BEFORE the
-    # `step:N - val/test_score/` boundary line). We buffer them until we see
-    # the boundary.
+    # Per-step accumulators (best_by_turn_3 keys + training scalars are
+    # printed line-by-line by wandb's pretty-printer; we buffer them and
+    # flush on each `step:N - ...` boundary line, classifying that step
+    # as eval (line contains `val/test_score`) or train (otherwise).
     pending_best3: dict[str, float] = {}
     pending_train: dict[str, float] = {}
-    last_train_step_printed: int = -1
-    last_eval_step_printed: int = -1
+    last_step_printed: tuple[int, str] = (-1, "")
 
     last_line_ts = time.time()
     last_alive_check = time.time()
     last_driver_alive = True
 
-    for raw in tail(log_path):
+    for raw in tail(log_path, from_start=args.from_start):
         last_line_ts = time.time()
         line = ANSI.sub('', raw)
 
-        # 1) collect best-by-turn-3 metrics as they stream
-        m = BEST3_LINE.search(line)
-        if m:
-            key, val = m.group(1), float(m.group(2))
-            pending_best3[key] = val
-            continue
+        # 1) collect best-by-turn-3 metrics — a single `step:N - ...` line
+        # can contain many `key:value` pairs separated by ` - `, so we must
+        # capture ALL matches per line (re.findall, not re.search).
+        for key, val in BEST3_LINE.findall(line):
+            try:
+                pending_best3[key] = float(val)
+            except ValueError:
+                pass
 
-        # 2) collect training scalar metrics as they stream
-        m = TRAIN_KV.search(line)
-        if m:
-            key, val = m.group(1), float(m.group(2))
-            pending_train[key] = val
-            continue
+        # 2) collect training scalar metrics, same rationale
+        for key, val in TRAIN_KV.findall(line):
+            try:
+                pending_train[key] = float(val)
+            except ValueError:
+                pass
 
-        # 3) eval-step boundary line
-        m = EVAL_LINE.search(line)
+        # 3) step boundary line: `step:N - <key>:<val> - <key>:<val> - ...`
+        # Classify as eval vs train by content, flush the matching buffer.
+        m = STEP_LINE.search(line)
         if m:
             step = int(m.group(1))
-            if step != last_eval_step_printed:
-                last_eval_step_printed = step
+            is_eval = 'val/test_score' in line or 'val/kernel/' in line
+            kind = 'EVAL' if is_eval else 'TRAIN'
+
+            # Dedupe — the trainer often prints multiple `step:N - ...` lines per
+            # step (one per metric group). Only print on the first kind transition.
+            if (step, kind) == last_step_printed:
+                continue
+            last_step_printed = (step, kind)
+
+            def fmt(x, p=3):
+                return f'{x:.{p}f}' if x is not None else '?'
+
+            if is_eval:
                 cor = pending_best3.get('correctness_rate')
-                f1 = pending_best3.get('fast@1')
-                f12 = pending_best3.get('fast@1.2')
-                f15 = pending_best3.get('fast@1.5')
-                meanp = pending_best3.get('mean_performance')
+                # Prefer _in_all variants (denominator = all 100 problems, like
+                # plot_baseline_vs_ncu.py); fall back to plain if absent.
+                f1 = pending_best3.get('fast@1_in_all') or pending_best3.get('fast@1')
+                f12 = pending_best3.get('fast@1.2_in_all') or pending_best3.get('fast@1.2')
+                f15 = pending_best3.get('fast@1.5_in_all') or pending_best3.get('fast@1.5')
+                meanp = pending_best3.get('mean_performance_in_all') or pending_best3.get('mean_performance')
                 maxp = pending_best3.get('max_performance')
                 count = pending_best3.get('count')
 
-                def fmt(x, p=4):
-                    return f'{x:.{p}f}' if x is not None else '?'
-
                 print(
                     f'\n[{now_str()}] [EVAL step={step}] best_by_turn_3: '
-                    f'correctness={fmt(cor,3)}  fast@1={fmt(f1,3)}  '
-                    f'fast@1.2={fmt(f12,3)}  fast@1.5={fmt(f15,3)}  '
-                    f'mean_perf={fmt(meanp,3)}  max_perf={fmt(maxp,2)}  '
+                    f'correctness={fmt(cor)}  fast@1={fmt(f1)}  '
+                    f'fast@1.2={fmt(f12)}  fast@1.5={fmt(f15)}  '
+                    f'mean_perf={fmt(meanp)}  max_perf={fmt(maxp,2)}  '
                     f'n={int(count) if count else "?"}',
                     flush=True,
                 )
                 pending_best3.clear()
-            continue
-
-        # 4) training-step boundary line
-        m = TRAIN_BOUNDARY.search(line)
-        if m:
-            step = int(m.group(1))
-            if step != last_train_step_printed:
-                last_train_step_printed = step
-
-                def fmt(x, p=4):
-                    return f'{x:.{p}f}' if x is not None else '?'
-
-                cor = pending_train.get('reward_extra/correctness/mean') or \
-                      pending_train.get('reward_extra/correctness_tensor/mean')
+            else:
+                cor = pending_train.get('critic/rewards_extra/correctness/mean')
+                cor_bt3 = pending_train.get('train/kernel/best_by_turn_3/correctness_rate')
                 score = pending_train.get('critic/score/mean')
                 stime = pending_train.get('timing_s/step')
                 grad = pending_train.get('actor/grad_norm')
-                perf = pending_train.get('reward_extra/performance/mean')
-                pos = pending_train.get('reward_extra/is_speedup_positive/mean')
+                rlen = pending_train.get('response_length/mean')
+                f1_bt3 = pending_train.get('train/kernel/best_by_turn_3/fast@1_in_all')
+                perf_bt3 = pending_train.get('train/kernel/best_by_turn_3/mean_performance_in_all')
 
                 print(
                     f'[{now_str()}] [TRAIN step={step}] '
                     f'step_time={fmt(stime,1)}s  '
-                    f'correctness_mean={fmt(cor,3)}  '
-                    f'critic/score/mean={fmt(score,3)}  '
-                    f'perf_mean={fmt(perf,3)}  '
-                    f'fast@1={fmt(pos,3)}  '
-                    f'grad_norm={fmt(grad,2)}',
+                    f'correctness_mean={fmt(cor)}  '
+                    f'critic/score/mean={fmt(score)}  '
+                    f'grad_norm={fmt(grad,2)}  '
+                    f'resp_len={fmt(rlen,0)}  '
+                    f'best_by_turn_3: correctness={fmt(cor_bt3)} '
+                    f'fast@1={fmt(f1_bt3)} mean_perf={fmt(perf_bt3)}',
                     flush=True,
                 )
                 pending_train.clear()
             continue
 
-        # 5) OOM / crash markers
-        for pat in OOM_PATTERNS:
-            if pat.search(line):
-                snippet = line.strip()[:200]
-                print(
-                    f'[{now_str()}] [ALERT] crash marker matched: {snippet}',
-                    flush=True,
-                )
-                break
+        # 5) OOM / crash markers — but skip Env Result JSON blobs and
+        # other normal-during-training error-string-containing lines.
+        # We only want REAL crashes (driver / worker process death,
+        # actual CUDA errors), not the model's own failed kernel
+        # compilations that get echoed back in server feedback.
+        if 'Env Result:' in line or 'runtime_error' in line or 'error_message' in line:
+            pass
+        else:
+            for pat in OOM_PATTERNS:
+                if pat.search(line):
+                    snippet = line.strip()[:200]
+                    print(
+                        f'[{now_str()}] [ALERT] crash marker matched: {snippet}',
+                        flush=True,
+                    )
+                    break
 
         # 6) periodic process-alive + hang check (every 30 s)
         if time.time() - last_alive_check > 30:
