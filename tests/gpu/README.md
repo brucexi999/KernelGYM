@@ -96,6 +96,44 @@ the trainer's decision.
 | "turn_idx=1 must always be enable_ncu=True, but saw False=N" | Old first-turn-only logic still in play. Check that `vllm_async_engine.py` passes `max_turns` in `reward_kwargs`. |
 | `Env Result with non-empty ncu_summary` count is 0 | Gating decisions correct, but model never produced a correct kernel on a non-final turn — change the fixture row or accept that this run's model couldn't compile. The gating check still passes. |
 
+## Live monitor for a running training job
+
+`training_monitor.py` tails a `drkernel_8b_rl_*.log` and prints
+structured events as the trainer progresses. Useful when babysitting a
+real (multi-hour) RL training run.
+
+```bash
+# Auto-discover the latest log under
+# /home/ubuntu/z84318463/logs/drkernel_baseline_ncu_rl/
+python3 tests/gpu/training_monitor.py
+
+# Or point at an explicit file:
+python3 tests/gpu/training_monitor.py /path/to/drkernel_8b_rl_<ts>.log
+```
+
+What it prints:
+
+- **`[TRAIN step=N | step_time=Xs | correctness_mean=Y | critic/score/mean=Z | ...]`**
+  one line per training step.
+- **`[EVAL step=N | best_by_turn_3: correctness=A | fast@1=B | fast@1.2=C | fast@1.5=D | mean_perf=E | max_perf=F | n=G]`**
+  one line per eval step, sourced from `val/kernel/best_by_turn_3/*` scalars
+  (the same metrics `plot_baseline_vs_ncu.py` plots).
+- **`[ALERT] ...`** on:
+  - `kernel.main_kernel` process disappearing (training driver dead),
+  - 15+ min of log silence (hang),
+  - OOM / CUDA error / NCCL error / Ray task error markers in the log.
+
+Defaults: `--hang-sec 900` (15 min silence triggers alert),
+`--log-dir /home/ubuntu/z84318463/logs/drkernel_baseline_ncu_rl/` for
+auto-discovery.
+
+Usage pattern for a babysat run:
+```bash
+bash /home/ubuntu/z84318463/baseline/launch_drkernel_8b_rl_baseline_ncu.sh --save_freq 60
+# launcher detaches into background; then in another shell:
+python3 tests/gpu/training_monitor.py | tee /tmp/monitor.log
+```
+
 ## Why this is not in CI
 
 Real `ncu` requires `sudo`, a CUDA GPU, the 8B checkpoint, and
